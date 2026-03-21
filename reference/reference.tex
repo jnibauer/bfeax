@@ -1,0 +1,500 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{parskip}
+
+\geometry{margin=1.2in}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!8},
+}
+
+\title{\textbf{Mathematical Reference}\\[0.5em]
+  \large Basis Function Expansion for Gravitational Potentials\\[0.3em]
+  \normalsize \texttt{bfeax} — JAX implementation}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% ===========================================================================
+\section{Overview}
+
+The code converts an arbitrary density function $\rho(\mathbf{x})$ into a
+smooth gravitational potential $\Phi(\mathbf{x})$ by decomposing in spherical
+harmonics angularly and using the radial Green's function for Poisson's
+equation.  The pipeline has four stages:
+
+\begin{enumerate}
+  \item Build a log-spaced radial grid $\{r_i\}$.
+  \item At each shell $r_i$, project $\rho$ onto spherical harmonics to obtain
+        the radial coefficients $\rho_{\ell m}(r_i)$.
+  \item Solve the radial Poisson equation for each $(\ell,m)$ mode to obtain
+        $\Phi_{\ell m}(r_i)$ using a Green's function with analytic boundary
+        corrections.
+  \item Fit natural cubic splines to $\Phi_{\ell m}(r)$ and $\rho_{\ell m}(r)$
+        for continuous evaluation.
+\end{enumerate}
+
+The potential and reconstructed density are then evaluated as
+\begin{align}
+  \Phi(\mathbf{x}) &= \sum_{\ell=0}^{\ell_{\max}} \sum_{m=-\ell}^{\ell}
+    \Phi_{\ell m}(r)\, Y_{\ell m}(\theta,\varphi), \\
+  \rho_{\rm rec}(\mathbf{x}) &= \sum_{\ell=0}^{\ell_{\max}} \sum_{m=-\ell}^{\ell}
+    \rho_{\ell m}(r)\, Y_{\ell m}(\theta,\varphi),
+\end{align}
+where $(r,\theta,\varphi)$ are standard spherical coordinates.  The
+gravitational acceleration is $\mathbf{a} = -\nabla\Phi$, computed via
+automatic differentiation.
+
+% ===========================================================================
+\section{Radial Grid}
+
+\subsection{Log-uniform spacing}
+
+All radial integrals are discretised on a grid of $N_r$ points uniformly
+spaced in $\log r$:
+\begin{equation}
+  r_i = \exp\!\left(\log r_{\min} + \frac{i}{N_r - 1}
+        \bigl(\log r_{\max} - \log r_{\min}\bigr)\right),
+  \quad i = 0, \ldots, N_r - 1.
+\end{equation}
+Log spacing allocates equal resolution per decade, which is appropriate for
+power-law profiles (e.g.\ NFW, Hernquist) that vary by many orders of
+magnitude across the radial range.
+
+\subsection{Parameter guidance}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Parameter & Typical value & Notes \\
+\midrule
+$r_{\min}$ & $\sim 10^{-2}\,r_s$ & Well inside the inner cusp \\
+$r_{\max}$ & $\geq 30\,r_s$      & Critical for NFW; outer integral diverges logarithmically \\
+$N_r$      & 64--128             & 128 gives $\lesssim 0.1\%$ for NFW \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ===========================================================================
+\section{Real Spherical Harmonics}
+
+\subsection{Convention}
+
+The code uses \emph{real orthonormal} spherical harmonics.  Starting from the
+complex harmonics $Y_\ell^m$, the real combinations are
+\begin{equation}
+  Y_{\ell m}(\theta,\varphi) =
+  \begin{cases}
+    \sqrt{2}\, N_{\ell m}\, P_\ell^{|m|}(\cos\theta)\,\cos(m\varphi)
+      & m > 0, \\
+    N_{\ell 0}\, P_\ell^0(\cos\theta)
+      & m = 0, \\
+    \sqrt{2}\, N_{\ell |m|}\, P_\ell^{|m|}(\cos\theta)\,\sin(|m|\varphi)
+      & m < 0,
+  \end{cases}
+\end{equation}
+with normalisation
+\begin{equation}
+  N_{\ell m} = \sqrt{\frac{2\ell+1}{4\pi}\frac{(\ell-|m|)!}{(\ell+|m|)!}}.
+\end{equation}
+These satisfy the orthonormality relation
+\begin{equation}
+  \int Y_{\ell m}\, Y_{\ell' m'}\,\mathrm{d}\Omega
+  = \delta_{\ell\ell'}\,\delta_{mm'}.
+\end{equation}
+
+\subsection{Associated Legendre recurrence}
+
+The associated Legendre polynomials $P_\ell^m(x)$ are computed via the
+three-term recurrence (evaluated at $x = \cos\theta$).  The seed and diagonal
+step are
+\begin{align}
+  P_0^0 &= 1, \\
+  P_\ell^\ell &= -(2\ell-1)\sin\theta\, P_{\ell-1}^{\ell-1}, \\
+  P_\ell^{\ell-1} &= (2\ell-1)\cos\theta\, P_{\ell-1}^{\ell-1},
+\end{align}
+and the upward recurrence for $m \leq \ell - 2$ is
+\begin{equation}
+  P_\ell^m = \frac{(2\ell-1)\cos\theta\, P_{\ell-1}^m
+             - (\ell+m-1)\, P_{\ell-2}^m}{\ell - m}.
+\end{equation}
+All $(\ell,m)$ pairs with $0 \leq m \leq \ell \leq \ell_{\max}$ are computed
+in a single sweep; the loop structure is unrolled at JAX trace time since
+$\ell_{\max}$ is a static Python integer.
+
+% ===========================================================================
+\section{Angular Projection}
+
+\subsection{Spherical harmonic decomposition at each shell}
+
+For each radius $r_i$, the density is integrated over the unit sphere:
+\begin{equation}
+  \rho_{\ell m}(r_i) = \int \rho(r_i,\theta,\varphi)\, Y_{\ell m}(\theta,\varphi)\,
+  \mathrm{d}\Omega.
+\end{equation}
+This is the fundamental step that converts the 3D density into a set of 1D
+radial functions, one per mode $(\ell,m)$.
+
+\subsection{Gauss--Legendre $\times$ uniform-$\varphi$ quadrature}
+
+The integral over the sphere is evaluated numerically as a product quadrature.
+In the $\cos\theta$ direction, $N_\theta$ Gauss--Legendre nodes $\{x_j,
+w_j\}$ are used (where $x_j = \cos\theta_j$ and $w_j$ are the GL weights in
+$\mathrm{d}(\cos\theta)$).  In the $\varphi$ direction, $N_\varphi$ equally
+spaced nodes with weight $\Delta\varphi = 2\pi/N_\varphi$ are used.  The
+discrete approximation is
+\begin{equation}
+  \rho_{\ell m}(r_i) \approx \sum_{j=1}^{N_\theta} \sum_{k=1}^{N_\varphi}
+    \rho(r_i, \theta_j, \varphi_k)\, Y_{\ell m}(\theta_j, \varphi_k)\,
+    w_j\, \Delta\varphi.
+\end{equation}
+Note that the GL rule integrates in $\mathrm{d}(\cos\theta)$, so the
+$\sin\theta$ Jacobian factor is \emph{not} included explicitly; it is
+absorbed into the GL weights.
+
+The angular quadrature is pre-evaluated once as a tensor
+$Y_{\ell m}^{jk} \equiv Y_{\ell m}(\theta_j,\varphi_k)$ of shape
+$(N_{\rm modes}, N_\theta, N_\varphi)$, and the projection over all radii is
+computed in a single \texttt{jnp.einsum}:
+\begin{equation}
+  \rho_{\ell m}(r_i) \approx \sum_{j,k} \rho(r_i,\theta_j,\varphi_k)\,
+  Y_{\ell m}^{jk}\, w_j\, \Delta\varphi.
+\end{equation}
+
+\subsection{Default quadrature orders}
+
+The Gauss--Legendre rule with $N_\theta$ points integrates polynomials of
+degree $2N_\theta - 1$ exactly.  For non-polynomial integrands (e.g.\ NFW),
+a factor of 3 margin is used:
+\begin{equation}
+  N_\theta = 3(\ell_{\max} + 2), \qquad
+  N_\varphi = 4\ell_{\max} + 7 \quad (\text{kept odd to avoid aliasing}).
+\end{equation}
+
+% ===========================================================================
+\section{Radial Poisson Solver}
+
+\subsection{Green's function solution}
+
+For each $(\ell,m)$ mode, the radial Poisson equation
+\begin{equation}
+  \frac{1}{r^2}\frac{\mathrm{d}}{\mathrm{d}r}\!\left(r^2
+  \frac{\mathrm{d}\Phi_{\ell m}}{\mathrm{d}r}\right)
+  - \frac{\ell(\ell+1)}{r^2}\Phi_{\ell m} = 4\pi G\,\rho_{\ell m}
+\end{equation}
+is solved via the standard Green's function (with $G=1$):
+\begin{equation}
+  \boxed{
+  \Phi_{\ell m}(r) = -\frac{4\pi}{2\ell+1}
+  \left[
+    r^{-(\ell+1)} I_{\rm in}(r)
+    + r^{\ell} I_{\rm out}(r)
+  \right],
+  }
+\end{equation}
+where the two cumulative integrals are
+\begin{align}
+  I_{\rm in}(r)  &= \int_0^r \rho_{\ell m}(r')\, r^{\prime\,\ell+2}\,
+                    \mathrm{d}r', \label{eq:Iin} \\
+  I_{\rm out}(r) &= \int_r^\infty \rho_{\ell m}(r')\, r^{\prime\,1-\ell}\,
+                    \mathrm{d}r'. \label{eq:Iout}
+\end{align}
+$I_{\rm in}$ is a running integral accumulated from small $r$ outward
+(``inside-out''); $I_{\rm out}$ is accumulated from large $r$ inward
+(``outside-in'').  Both are evaluated by the trapezoidal rule on the
+log-spaced grid.
+
+\subsection{Trapezoidal discretisation}
+
+Let $f_i^{\rm in} = \rho_{\ell m}(r_i)\, r_i^{\ell+2}$ and
+$\Delta r_i = r_{i+1} - r_i$.  Then
+\begin{equation}
+  I_{\rm in}(r_i) = \Delta I_{\rm in}
+  + \sum_{j=0}^{i-1} \tfrac{1}{2}\bigl(f_j^{\rm in} + f_{j+1}^{\rm in}\bigr)
+    \Delta r_j,
+\end{equation}
+where $\Delta I_{\rm in}$ is the analytic inner tail correction (Section
+\ref{sec:boundary}).  The outside-in sum for $I_{\rm out}$ is constructed
+analogously via a reversed cumulative sum.
+
+% ===========================================================================
+\section{Boundary Corrections}
+\label{sec:boundary}
+
+The grid covers only $[r_{\min}, r_{\max}]$, but the integrals in
+equations~\eqref{eq:Iin}--\eqref{eq:Iout} extend to $0$ and $\infty$
+respectively.  Both truncations can introduce significant bias, particularly
+for the NFW outer integral which diverges logarithmically unless $r_{\max}$ is
+very large.
+
+\subsection{Inner tail correction ($0 \to r_{\min}$)}
+
+The power-law slope of $\rho_{\ell m}$ near $r_{\min}$ is estimated from the
+first three grid points via a log--log finite difference:
+\begin{equation}
+  \alpha_{\rm in} \approx \left\langle
+    \frac{\Delta\log|\rho_{\ell m}|}{\Delta\log r}
+  \right\rangle_{r_0,r_1,r_2}.
+\end{equation}
+Assuming $\rho_{\ell m}(r) \approx A_{\rm in}\, r^{\alpha_{\rm in}}$ for
+$r < r_{\min}$, the inner integral contribution is
+\begin{equation}
+  \Delta I_{\rm in}
+  = \int_0^{r_{\min}} A_{\rm in}\, r^{\alpha_{\rm in}}\, r^{\ell+2}\,\mathrm{d}r
+  = \frac{A_{\rm in}\, r_{\min}^{\alpha_{\rm in}+\ell+3}}
+         {\alpha_{\rm in} + \ell + 3},
+\end{equation}
+which converges provided $\alpha_{\rm in} + \ell + 3 > 0$ (always satisfied
+for physical density cusps with $\alpha_{\rm in} > -3$).  The correction is
+added as a constant to $I_{\rm in}(r)$ for all $r \geq r_{\min}$.
+
+The amplitude is recovered as
+$A_{\rm in} = \mathrm{sign}(\rho_{\ell m}(r_0)) \cdot
+|\rho_{\ell m}(r_0)| \cdot r_0^{-\alpha_{\rm in}}$,
+using \texttt{exp(alpha * log(r))} to avoid overflow when $\alpha_{\rm in}$
+is a traced JAX scalar.
+
+\subsection{Outer tail correction ($r_{\max} \to \infty$)}
+\label{sec:outer}
+
+Similarly, the slope at the outer boundary is estimated from the last three
+grid points:
+\begin{equation}
+  \alpha_{\rm out} \approx \left\langle
+    \frac{\Delta\log|\rho_{\ell m}|}{\Delta\log r}
+  \right\rangle_{r_{N_r-3},r_{N_r-2},r_{N_r-1}}.
+\end{equation}
+Assuming $\rho_{\ell m}(r) \approx A_{\rm out}\, r^{\alpha_{\rm out}}$ for
+$r > r_{\max}$,
+\begin{equation}
+  \Delta I_{\rm out}
+  = \int_{r_{\max}}^\infty A_{\rm out}\, r^{\alpha_{\rm out}}\, r^{1-\ell}\,\mathrm{d}r
+  = \frac{A_{\rm out}\, r_{\max}^{2-\ell}}
+         {\ell - \alpha_{\rm out} - 2},
+\end{equation}
+which converges provided $\alpha_{\rm out} < \ell - 2$.  For the monopole
+$\ell=0$ this requires $\alpha_{\rm out} < -2$; for NFW $(\alpha_{\rm
+out}\approx -3)$ this is satisfied for all $\ell \geq 0$.
+
+\textbf{Guard conditions.}  Both corrections are applied only when
+\begin{itemize}
+  \item the boundary value $|\rho_{\ell m}(r_{\rm boundary})|$ exceeds
+        $10^{-8}$ of the per-mode maximum (inner), or $\rho_{\ell m} > 0$
+        (outer), and
+  \item the power-law integral converges.
+\end{itemize}
+All conditionals use \texttt{jnp.where} to remain JIT-safe; neither branch
+propagates NaNs.
+
+% ===========================================================================
+\section{Inner Cusp Subtraction}
+\label{sec:cusp}
+
+\subsection{Motivation}
+
+For profiles with a steep inner cusp (e.g.\ NFW: $\rho \sim r^{-1}$), the
+radial coefficients $\rho_{\ell m}(r)$ diverge toward $r=0$.  Fitting a
+cubic spline directly to such data is poorly conditioned near $r_{\min}$:
+small rounding errors in $\rho_{\ell m}(r_{\min})$ lead to large oscillations
+in the fitted spline.
+
+\subsection{Procedure}
+
+For each mode $(\ell,m)$:
+\begin{enumerate}
+  \item Estimate the inner power-law parameters $(\alpha_{\ell m}, A_{\ell m})$
+        from the first three grid points (same finite-difference estimator as
+        in Section~\ref{sec:boundary}).
+  \item Define the background $\mathrm{bg}(r) = A_{\ell m}\, r^{\alpha_{\ell m}}$.
+  \item Fit the cubic spline to the \emph{residual}
+        $\widetilde{\rho}_{\ell m}(r) = \rho_{\ell m}(r) - \mathrm{bg}(r)$,
+        which is smooth and nearly flat near $r_{\min}$.
+  \item At evaluation time, reconstruct
+        $\rho_{\ell m}(r) = \widetilde{\rho}_{\ell m}(r) + A_{\ell m}\,
+        r^{\alpha_{\ell m}}$.
+\end{enumerate}
+
+\subsection{Guard}
+
+The subtraction is only applied when
+\begin{equation}
+  |\rho_{\ell m}(r_{\min})| > 10^{-6} \cdot \rho_{\rm scale},
+\end{equation}
+where $\rho_{\rm scale} = \max_{\ell m}\max_i |\rho_{\ell m}(r_i)|$ is the
+\emph{global} amplitude scale across all modes.  This prevents spurious
+large backgrounds on symmetry-zero modes (e.g.\ odd-$\ell$ modes of an
+octant-symmetric density) whose values sit at machine-epsilon level.
+
+% ===========================================================================
+\section{Spline Interpolation}
+
+\subsection{Natural cubic splines in $\log r$}
+
+Both $\Phi_{\ell m}(r)$ and $\rho_{\ell m}(r)$ are stored as natural cubic
+splines parameterised in $u = \log r$.  On each interval
+$[u_i, u_{i+1}]$, the spline takes the form
+\begin{equation}
+  S(u) = a_i + b_i\,(u - u_i) + c_i\,(u-u_i)^2 + d_i\,(u-u_i)^3.
+\end{equation}
+
+\subsection{Fitting}
+
+The coefficients are determined by requiring $S$ to be $C^2$ everywhere, with
+natural boundary conditions $S''(u_0) = S''(u_{N_r-1}) = 0$.  This leads to
+the tridiagonal system for the second derivatives $M_i = S''(u_i)$:
+\begin{equation}
+  h_{i-1}\,M_{i-1} + 2(h_{i-1}+h_i)\,M_i + h_i\,M_{i+1}
+  = 3\!\left(\frac{y_{i+1}-y_i}{h_i} - \frac{y_i - y_{i-1}}{h_{i-1}}\right),
+\end{equation}
+where $h_i = u_{i+1} - u_i$ and $y_i$ are the function values.  This is
+solved via \texttt{jnp.linalg.solve} on the $(N_r-2)\times(N_r-2)$ dense
+matrix (safe to JIT since array shapes are static).  The polynomial
+coefficients follow as
+\begin{align}
+  a_i &= y_i, \\
+  b_i &= \frac{y_{i+1}-y_i}{h_i} - \frac{h_i\,(2M_i + M_{i+1})}{3}, \\
+  c_i &= M_i, \\
+  d_i &= \frac{M_{i+1} - M_i}{3\,h_i}.
+\end{align}
+
+\subsection{Batched fitting}
+
+When building the expansion via the fast (spheroid) path, all $N_{\rm modes}$
+splines share the same $\log r$ knots.  A single matrix factorisation of the
+$(N_r-2)\times(N_r-2)$ system is applied to the full right-hand side matrix
+of shape $(N_r-2)\times N_{\rm modes}$ simultaneously, avoiding redundant
+factorisations.
+
+\subsection{Evaluation}
+
+For a query $u^* = \log r^*$, the interval index is found via binary search
+(\texttt{jnp.searchsorted}), then the cubic polynomial is evaluated with
+Horner's method.  Out-of-range queries are clamped to the nearest boundary
+interval.
+
+% ===========================================================================
+\section{Potential Evaluation}
+
+\subsection{Coordinate conversion}
+
+Cartesian coordinates $(x,y,z)$ are converted to spherical $(r,\theta,\varphi)$:
+\begin{equation}
+  r = \|\mathbf{x}\|, \quad
+  \theta = \arccos\!\left(\frac{z}{r}\right), \quad
+  \varphi = \mathrm{atan2}(y,x) \bmod 2\pi.
+\end{equation}
+
+\subsection{Stacked evaluation path}
+
+For expansions built via the fast path (\texttt{from\_spheroid} or
+\texttt{ExpansionGrid}), all mode splines are stored as batched coefficient
+arrays of shape $(N_{\rm modes}, N_r - 1)$.  A single \texttt{searchsorted}
+call finds the radial interval, and the polynomial is evaluated for all modes
+simultaneously:
+\begin{equation}
+  \Phi_{\ell m}(r^*) = a_{\ell m,\,i}
+  + b_{\ell m,\,i}\,\delta u
+  + c_{\ell m,\,i}\,\delta u^2
+  + d_{\ell m,\,i}\,\delta u^3,
+  \quad \delta u = \log r^* - u_i.
+\end{equation}
+The final summation is a single dot product:
+\begin{equation}
+  \Phi(\mathbf{x}) = \sum_{\ell m} \Phi_{\ell m}(r^*)\, Y_{\ell m}(\theta,\varphi)
+  = \mathbf{\Phi}_{\rm modes} \cdot \mathbf{Y}_{\rm modes}.
+\end{equation}
+
+\subsection{Accelerations}
+
+Gravitational accelerations are obtained via automatic differentiation:
+\begin{equation}
+  \mathbf{a}(\mathbf{x}) = -\nabla_{\mathbf{x}}\,\Phi(\mathbf{x}),
+\end{equation}
+implemented as \texttt{jax.vmap(jax.grad(\_\_call\_\_))}.  No analytical
+gradient formula is required.
+
+% ===========================================================================
+\section{Scan-based Poisson Solve}
+
+\subsection{Motivation}
+
+Inside the JIT-compiled build functions, the naive Python loop
+\texttt{for l in range(l\_max+1)} causes XLA to unroll $\ell_{\max}+1$
+separate subgraphs — one per $\ell$ value — each with statically known
+exponents.  For large $\ell_{\max}$ this inflates compilation time
+significantly.
+
+\subsection{Implementation}
+
+The loop is replaced by \texttt{jax.lax.scan} over all $N_{\rm modes} =
+(\ell_{\max}+1)^2$ modes in a flat ordering.  A precomputed array
+$\ell_{\rm mode}[k]$ stores the $\ell$ value for the $k$-th mode.  The scan
+body processes one column $\rho_{\ell m}(\cdot)$ per step:
+\begin{lstlisting}
+l_per_mode = [l for l in range(l_max+1) for _ in range(2*l+1)]
+_, phi_T = jax.lax.scan(solve_one, None, (rho_lm_all.T, l_per_mode))
+\end{lstlisting}
+Because $\ell$ is now a traced float, the power-law terms are computed as
+\begin{equation}
+  r^{\ell+2} \;\longrightarrow\; \exp\!\bigl((\ell+2)\log r\bigr),
+\end{equation}
+which is numerically equivalent and avoids Python-level specialisation.  XLA
+compiles a single generic body and amortises it over all steps, yielding
+substantially shorter compilation time for large $\ell_{\max}$.
+
+% ===========================================================================
+\section{Convergence}
+
+For a triaxial NFW halo ($q_1=0.8$, $q_2=0.5$) with $N_r=128$,
+$r_{\max}=300\,r_s$, the density reconstruction error decreases geometrically:
+
+\begin{center}
+\begin{tabular}{cc}
+\toprule
+$\ell_{\max}$ & Median relative error \\
+\midrule
+4  & $\sim 3\%$ \\
+6  & $\sim 0.8\%$ \\
+8  & $\sim 0.2\%$ \\
+10 & $\sim 0.06\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The error drops approximately $4\times$ per $\Delta\ell = 2$, consistent
+with geometric (spectral) convergence in the angular expansion.  The potential
+converges faster than the density; $\ell_{\max} = 2$--$4$ is often sufficient
+for potential applications.
+
+% ===========================================================================
+\section{Module Summary}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+File & Responsibility \\
+\midrule
+\texttt{grid.py}          & Log-spaced radial grid \\
+\texttt{sph\_harm.py}     & Real $Y_{\ell m}$ via Legendre recurrence; GL $\times$ uniform quadrature grid \\
+\texttt{density\_coeffs.py} & Angular projection $\rho \to \rho_{\ell m}(r_i)$ via \texttt{vmap} + \texttt{einsum} \\
+\texttt{spline.py}        & Natural cubic splines in JAX (JIT-safe, batched fitting) \\
+\texttt{poisson.py}       & Green's function radial Poisson solver with boundary corrections \\
+\texttt{potential.py}     & \texttt{MultipoleExpansion} class; fast-path \texttt{jax.lax.scan} Poisson solve \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

@@ -45,6 +45,82 @@ from .sph_harm import ylm_real, ylm_grid
 
 
 # ---------------------------------------------------------------------------
+# Poisson solve — scan over all (l, m) modes
+# ---------------------------------------------------------------------------
+
+def _poisson_scan(
+    rho_lm_all: "Float[Array, 'nr n_modes']",
+    r_grid:     "Float[Array, 'nr']",
+    l_per_mode: "Float[Array, 'n_modes']",
+) -> "Float[Array, 'nr n_modes']":
+    """
+    Solve the radial Poisson equation for every (l,m) mode via jax.lax.scan.
+
+    Replaces the Python `for l in range(l_max+1)` loop that previously
+    unrolled l_max+1 separate XLA subgraphs.  Scan compiles a single body
+    and steps through all n_modes = (l_max+1)^2 modes sequentially, which
+    substantially reduces XLA compilation time for large l_max.
+
+    Parameters
+    ----------
+    rho_lm_all : (n_r, n_modes)  — angular-projected density coefficients
+    r_grid     : (n_r,)          — radial grid
+    l_per_mode : (n_modes,)      — l value (as float) for each mode, in the
+                                   same ordering as rho_lm_all columns.
+    Returns
+    -------
+    phi_lm_all : (n_r, n_modes)
+    """
+    log_r = jnp.log(r_grid)
+    dr    = jnp.diff(r_grid)
+    _4PI  = 4.0 * jnp.pi
+
+    def _solve_one(_, xs):
+        rho_col, l_f = xs   # (n_r,), scalar float
+
+        f_in  = rho_col * jnp.exp((l_f + 2.0) * log_r)
+        f_out = rho_col * jnp.exp((1.0 - l_f)  * log_r)
+
+        # Inner power-law correction (0 → r_min)
+        log_rho3 = jnp.log(jnp.abs(rho_col[:3]) + 1e-300)
+        alpha_in = jnp.mean(jnp.diff(log_rho3) / jnp.diff(log_r[:3]))
+        A_in     = jnp.sign(rho_col[0]) * jnp.abs(rho_col[0]) * jnp.exp(-alpha_in * log_r[0])
+        rho_sc   = jnp.max(jnp.abs(rho_col)) + 1e-300
+        active_in = jnp.abs(rho_col[0]) > 1e-8 * rho_sc
+        exp_in   = alpha_in + l_f + 3.0
+        safe_in  = jnp.where(jnp.abs(exp_in) > 1e-6, exp_in, 1e-6)
+        dI_in    = A_in * jnp.exp((alpha_in + l_f + 3.0) * log_r[0]) / safe_in
+        dI_in    = jnp.where(active_in & (exp_in > 0.0), dI_in, 0.0)
+
+        trap_in = 0.5 * (f_in[:-1] + f_in[1:]) * dr
+        I_in    = jnp.concatenate([jnp.zeros(1), jnp.cumsum(trap_in)]) + dI_in
+
+        # Outer power-law correction (r_max → ∞)
+        log_rho3o = jnp.log(jnp.abs(rho_col[-3:]) + 1e-300)
+        alpha_out = jnp.mean(jnp.diff(log_rho3o) / jnp.diff(log_r[-3:]))
+        active_out = rho_col[-1] > 0.0
+        tail_conv  = alpha_out < (l_f - 2.0)
+        safe_out   = jnp.where(jnp.abs(l_f - alpha_out - 2.0) > 1e-6,
+                               l_f - alpha_out - 2.0, 1e-6)
+        dI_out     = rho_col[-1] * jnp.exp((2.0 - l_f) * log_r[-1]) / safe_out
+        dI_out     = jnp.where(active_out & tail_conv, dI_out, 0.0)
+
+        trap_out = 0.5 * (f_out[:-1] + f_out[1:]) * dr
+        I_out    = jnp.concatenate(
+            [jnp.cumsum(trap_out[::-1])[::-1], jnp.zeros(1)]
+        ) + dI_out
+
+        phi_col = -_4PI / (2.0 * l_f + 1.0) * (
+            jnp.exp(-(l_f + 1.0) * log_r) * I_in
+            + jnp.exp(l_f * log_r) * I_out
+        )
+        return None, phi_col
+
+    _, phi_T = jax.lax.scan(_solve_one, None, (rho_lm_all.T, l_per_mode))
+    return phi_T.T   # (n_r, n_modes)
+
+
+# ---------------------------------------------------------------------------
 # Inner power-law helper
 # ---------------------------------------------------------------------------
 
@@ -153,65 +229,11 @@ def _spheroid_core(r_grid, rho0, sph_alpha, beta, gamma, a, p, q, r_cut, xi,
     rho_lm_all = jnp.einsum('rij,lij,ij->rl', rho_vals, Y_stack, w2d)
     # shape: (n_r, n_modes)
 
-    # ── Poisson solve (batched over m for each l) ────────────────────────
-    _4PI = 4.0 * jnp.pi
-    phi_lm_all = jnp.zeros((n_r, n_modes))
-
-    for l in range(l_max + 1):
-        i0  = l * l
-        i1  = (l + 1) ** 2
-        n_m = 2 * l + 1
-        rho_m = rho_lm_all[:, i0:i1]                    # (n_r, n_m)
-
-        f_in  = rho_m * r_grid[:, None] ** (l + 2)
-        f_out = rho_m * r_grid[:, None] ** (1 - l)
-
-        # Inner boundary correction
-        log_rho3 = jnp.log(jnp.abs(rho_m[:3, :]) + 1e-300)
-        log_r3   = jnp.log(r_grid[:3])
-        a_in = jnp.mean(
-            jnp.diff(log_rho3, axis=0) / jnp.diff(log_r3)[:, None], axis=0
-        )  # (n_m,)
-        sign_in = jnp.sign(rho_m[0, :])
-        A_in    = sign_in * jnp.abs(rho_m[0, :]) / (r_grid[0] ** a_in)
-
-        rho_sc = jnp.max(jnp.abs(rho_m), axis=0) + 1e-300
-        active_in = jnp.abs(rho_m[0, :]) > 1e-8 * rho_sc
-        exp_in    = a_in + (l + 3)
-        safe_in   = jnp.where(jnp.abs(exp_in) > 1e-6, exp_in, 1e-6)
-        dI_in     = A_in * r_grid[0] ** (a_in + (l + 3)) / safe_in
-        dI_in     = jnp.where(active_in & (exp_in > 0.0), dI_in, 0.0)
-
-        trap_in = 0.5 * (f_in[:-1] + f_in[1:]) * dr[:, None]
-        I_in    = jnp.concatenate(
-            [jnp.zeros((1, n_m)), jnp.cumsum(trap_in, axis=0)], axis=0
-        ) + dI_in[None, :]
-
-        # Outer boundary correction
-        log_rho3o = jnp.log(jnp.abs(rho_m[-3:, :]) + 1e-300)
-        log_r3o   = jnp.log(r_grid[-3:])
-        a_out = jnp.mean(
-            jnp.diff(log_rho3o, axis=0) / jnp.diff(log_r3o)[:, None], axis=0
-        )
-        active_out = rho_m[-1, :] > 0.0
-        tail_conv  = a_out < (l - 2)
-        safe_out   = jnp.where(
-            jnp.abs(l - a_out - 2) > 1e-6, l - a_out - 2, 1e-6
-        )
-        dI_out = rho_m[-1, :] * r_grid[-1] ** (2 - l) / safe_out
-        dI_out = jnp.where(active_out & tail_conv, dI_out, 0.0)
-
-        trap_out  = 0.5 * (f_out[:-1] + f_out[1:]) * dr[:, None]
-        I_out_rev = jnp.cumsum(trap_out[::-1], axis=0)[::-1]
-        I_out     = jnp.concatenate(
-            [I_out_rev, jnp.zeros((1, n_m))], axis=0
-        ) + dI_out[None, :]
-
-        phi_m = -_4PI / (2 * l + 1) * (
-            r_grid[:, None] ** (-(l + 1)) * I_in
-            + r_grid[:, None] ** l * I_out
-        )
-        phi_lm_all = phi_lm_all.at[:, i0:i1].set(phi_m)
+    # ── Poisson solve (scan over all modes) ──────────────────────────────
+    l_per_mode = jnp.array(
+        [float(l) for l in range(l_max + 1) for _ in range(2 * l + 1)]
+    )
+    phi_lm_all = _poisson_scan(rho_lm_all, r_grid, l_per_mode)
 
     # ── Cusp subtraction (vectorised over all modes) ─────────────────────
     global_scale = jnp.max(jnp.abs(rho_lm_all))
@@ -269,64 +291,11 @@ def _build_expansion_from_grid(r_grid, rho_on_grid, Y_stack, w2d, l_max):
     # ── Angular projection ───────────────────────────────────────────────
     rho_lm_all = jnp.einsum('rij,lij,ij->rl', rho_on_grid, Y_stack, w2d)
 
-    # ── Poisson solve (batched over m for each l) ────────────────────────
-    _4PI = 4.0 * jnp.pi
-    phi_lm_all = jnp.zeros((n_r, n_modes))
-
-    for l in range(l_max + 1):
-        i0  = l * l
-        i1  = (l + 1) ** 2
-        n_m = 2 * l + 1
-        rho_m = rho_lm_all[:, i0:i1]
-
-        f_in  = rho_m * r_grid[:, None] ** (l + 2)
-        f_out = rho_m * r_grid[:, None] ** (1 - l)
-
-        # Inner boundary correction
-        log_rho3 = jnp.log(jnp.abs(rho_m[:3, :]) + 1e-300)
-        log_r3   = jnp.log(r_grid[:3])
-        a_in = jnp.mean(
-            jnp.diff(log_rho3, axis=0) / jnp.diff(log_r3)[:, None], axis=0
-        )
-        sign_in = jnp.sign(rho_m[0, :])
-        A_in    = sign_in * jnp.abs(rho_m[0, :]) / (r_grid[0] ** a_in)
-        rho_sc    = jnp.max(jnp.abs(rho_m), axis=0) + 1e-300
-        active_in = jnp.abs(rho_m[0, :]) > 1e-8 * rho_sc
-        exp_in    = a_in + (l + 3)
-        safe_in   = jnp.where(jnp.abs(exp_in) > 1e-6, exp_in, 1e-6)
-        dI_in     = A_in * r_grid[0] ** (a_in + (l + 3)) / safe_in
-        dI_in     = jnp.where(active_in & (exp_in > 0.0), dI_in, 0.0)
-
-        trap_in = 0.5 * (f_in[:-1] + f_in[1:]) * dr[:, None]
-        I_in    = jnp.concatenate(
-            [jnp.zeros((1, n_m)), jnp.cumsum(trap_in, axis=0)], axis=0
-        ) + dI_in[None, :]
-
-        # Outer boundary correction
-        log_rho3o = jnp.log(jnp.abs(rho_m[-3:, :]) + 1e-300)
-        log_r3o   = jnp.log(r_grid[-3:])
-        a_out = jnp.mean(
-            jnp.diff(log_rho3o, axis=0) / jnp.diff(log_r3o)[:, None], axis=0
-        )
-        active_out = rho_m[-1, :] > 0.0
-        tail_conv  = a_out < (l - 2)
-        safe_out   = jnp.where(
-            jnp.abs(l - a_out - 2) > 1e-6, l - a_out - 2, 1e-6
-        )
-        dI_out = rho_m[-1, :] * r_grid[-1] ** (2 - l) / safe_out
-        dI_out = jnp.where(active_out & tail_conv, dI_out, 0.0)
-
-        trap_out  = 0.5 * (f_out[:-1] + f_out[1:]) * dr[:, None]
-        I_out_rev = jnp.cumsum(trap_out[::-1], axis=0)[::-1]
-        I_out     = jnp.concatenate(
-            [I_out_rev, jnp.zeros((1, n_m))], axis=0
-        ) + dI_out[None, :]
-
-        phi_m = -_4PI / (2 * l + 1) * (
-            r_grid[:, None] ** (-(l + 1)) * I_in
-            + r_grid[:, None] ** l * I_out
-        )
-        phi_lm_all = phi_lm_all.at[:, i0:i1].set(phi_m)
+    # ── Poisson solve (scan over all modes) ──────────────────────────────
+    l_per_mode = jnp.array(
+        [float(l) for l in range(l_max + 1) for _ in range(2 * l + 1)]
+    )
+    phi_lm_all = _poisson_scan(rho_lm_all, r_grid, l_per_mode)
 
     # ── Cusp subtraction (vectorised) ────────────────────────────────────
     global_scale = jnp.max(jnp.abs(rho_lm_all))
@@ -418,16 +387,14 @@ class ExpansionGrid:
     def __call__(
         self,
         rho,
-        sigma_taper: bool = False,
     ) -> "MultipoleExpansion":
         """Build a MultipoleExpansion from a density function rho(x, y, z)."""
         rho_on_grid = jax.vmap(jax.vmap(jax.vmap(rho)))(self.x, self.y, self.z)
-        return self.from_values(rho_on_grid, sigma_taper=sigma_taper)
+        return self.from_values(rho_on_grid)
 
     def from_values(
         self,
         rho_on_grid: Float[Array, "n_r n_theta n_phi"],
-        sigma_taper: bool = False,
     ) -> "MultipoleExpansion":
         """
         Build from precomputed density values on the grid.
@@ -443,7 +410,7 @@ class ExpansionGrid:
         log_r   = jnp.log(self._r_grid)
         stacked = (log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As)
         return MultipoleExpansion(
-            self.l_max, {}, {}, sigma_taper=sigma_taper, _stacked=stacked,
+            self.l_max, {}, {}, _stacked=stacked,
         )
 
 
@@ -471,33 +438,17 @@ class MultipoleExpansion:
         l_max: int,
         phi_splines: dict[tuple[int, int], tuple],
         rho_splines: dict[tuple[int, int], tuple],
-        sigma_taper: bool = False,
         *,
         _stacked: tuple | None = None,
     ):
         self.l_max = l_max
         self._phi_splines = phi_splines
         self._rho_splines = rho_splines
-        self.sigma_taper = sigma_taper
 
         # Optional stacked representation for fast-path eval (from_spheroid).
         # Format: (log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As)
         # where phi_coeffs/rho_res_coeffs are (a,b,c,d) tuples of (n_modes, n_r-1).
         self._stacked = _stacked
-
-        # Precompute Lanczos sigma factors  σ_l = sinc(l / (L+1))
-        L = l_max
-        ls = jnp.arange(L + 1, dtype=float)
-        x  = jnp.pi * ls / (L + 1)
-        self._sigma_arr = jnp.where(ls == 0, 1.0, jnp.sin(x) / x)  # shape (L+1,)
-
-        # Per-mode sigma weight vector for stacked path
-        if _stacked is not None:
-            sigma_per_mode = []
-            for l in range(l_max + 1):
-                for m in range(-l, l + 1):
-                    sigma_per_mode.append(float(self._sigma_arr[l]))
-            self._sigma_vec = jnp.array(sigma_per_mode)  # (n_modes,)
 
     # ------------------------------------------------------------------
     # Construction
@@ -513,7 +464,6 @@ class MultipoleExpansion:
         l_max: int,
         n_theta: int | None = None,
         n_phi: int | None = None,
-        sigma_taper: bool = False,
     ) -> "MultipoleExpansion":
         """
         Build a MultipoleExpansion from a density function rho(x,y,z).
@@ -525,11 +475,8 @@ class MultipoleExpansion:
         r_max   : outer radius of the radial grid
         n_r     : number of radial grid points
         l_max   : maximum spherical harmonic degree
-        n_theta      : GL quadrature nodes  (default: 3*(l_max+2))
-        n_phi        : uniform phi points   (default: 4*l_max+7)
-        sigma_taper  : if True, apply Lanczos sigma factors to the density
-                       reconstruction to suppress Gibbs ringing.  Has no
-                       effect on the potential evaluation.
+        n_theta : GL quadrature nodes  (default: 3*(l_max+2))
+        n_phi   : uniform phi points   (default: 4*l_max+7)
         """
         r_grid = make_radial_grid(n_r, r_min, r_max)
         log_r  = jnp.log(r_grid)
@@ -560,7 +507,7 @@ class MultipoleExpansion:
         # ── Poisson solve -> Phi_lm splines ──────────────────────────
         phi_splines = solve_poisson_lm(r_grid, rho_lm)
 
-        return cls(l_max, phi_splines, rho_splines, sigma_taper=sigma_taper)
+        return cls(l_max, phi_splines, rho_splines)
 
     @classmethod
     def from_spheroid(
@@ -581,7 +528,6 @@ class MultipoleExpansion:
         l_max: int = 8,
         n_theta: int | None = None,
         n_phi: int | None = None,
-        sigma_taper: bool = False,
     ) -> "MultipoleExpansion":
         """
         Build a MultipoleExpansion from Agama-style spheroid parameters.
@@ -613,7 +559,7 @@ class MultipoleExpansion:
         # Store stacked arrays directly — skip dict unpacking
         stacked = (log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As)
 
-        return cls(l_max, {}, {}, sigma_taper=sigma_taper, _stacked=stacked)
+        return cls(l_max, {}, {}, _stacked=stacked)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -651,8 +597,6 @@ class MultipoleExpansion:
             # Add back power-law background: A * exp(alpha * log_r)
             bg = rho_As[:, None] * jnp.exp(rho_alphas[:, None] * log_r_q[None, :])
             vals = vals + bg
-            if self.sigma_taper:
-                vals = vals * self._sigma_vec[:, None]
 
         # Y_lm at query points
         theta_1d = jnp.atleast_1d(theta)
@@ -692,14 +636,12 @@ class MultipoleExpansion:
         theta: Float[Array, "..."],
         phi: Float[Array, "..."],
         shape,
-        apply_sigma: bool = False,
     ) -> Float[Array, "..."]:
-        Ylm    = ylm_real(self.l_max, theta, phi)
-        result = jnp.zeros(shape)
-        for (l, m), val in lm_vals.items():
-            w = self._sigma_arr[l] if apply_sigma else 1.0
-            result = result + w * val * Ylm[(l, m)]
-        return result
+        lm_keys = [(l, m) for l in range(self.l_max + 1) for m in range(-l, l + 1)]
+        Ylm     = ylm_real(self.l_max, theta, phi)
+        val_arr = jnp.stack([lm_vals[k] for k in lm_keys])  # (n_modes, *shape)
+        Y_arr   = jnp.stack([Ylm[k]     for k in lm_keys])  # (n_modes, *shape)
+        return jnp.sum(val_arr * Y_arr, axis=0)
 
     # ------------------------------------------------------------------
     # Public evaluation methods
@@ -711,7 +653,7 @@ class MultipoleExpansion:
         y: Float[Array, "..."],
         z: Float[Array, "..."],
     ) -> Float[Array, "..."]:
-        """Evaluate Phi(x, y, z).  Sigma tapering is never applied here."""
+        """Evaluate Phi(x, y, z)."""
         r, theta, phi = _cartesian_to_spherical(x, y, z)
         log_r = jnp.log(jnp.clip(r, 1e-30))
         if self._stacked is not None:
@@ -725,25 +667,13 @@ class MultipoleExpansion:
         y: Float[Array, "..."],
         z: Float[Array, "..."],
     ) -> Float[Array, "..."]:
-        """
-        Evaluate the reconstructed density rho_rec(x, y, z).
-
-        rho_rec = sum_{l,m} [sigma_l] * rho_lm(r) * Y_lm(theta, phi)
-
-        The optional Lanczos sigma factor sigma_l = sin(pi*l/(L+1))/(pi*l/(L+1))
-        is applied when sigma_taper=True was passed to from_density().
-        It suppresses Gibbs ringing at the cost of mild smoothing near the
-        sharpest angular gradients.
-        """
+        """Evaluate the reconstructed density rho_rec(x, y, z)."""
         r, theta, phi = _cartesian_to_spherical(x, y, z)
         log_r = jnp.log(jnp.clip(r, 1e-30))
         if self._stacked is not None:
             return self._eval_stacked(log_r, theta, phi, kind="rho")
         rho_lm = self._eval_rho_lm(r, log_r)
-        return self._sum_over_lm(
-            rho_lm, theta, phi, r.shape,
-            apply_sigma=self.sigma_taper,
-        )
+        return self._sum_over_lm(rho_lm, theta, phi, r.shape)
 
     def acceleration(
         self,
