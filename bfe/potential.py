@@ -681,12 +681,7 @@ class MultipoleExpansion:
         y: Float[Array, "..."],
         z: Float[Array, "..."],
     ) -> tuple[Float[Array, "..."], Float[Array, "..."], Float[Array, "..."]]:
-        """Return gravitational acceleration (ax, ay, az) = -grad Phi via autodiff.
-
-        Uses jax.vmap(jax.grad(...)) so each point gets its own scalar gradient,
-        avoiding the batch-indexing bug that arises from stacking into (N,3) and
-        indexing with xyz[0], xyz[1], xyz[2] (which selects rows, not columns).
-        """
+        """Return gravitational acceleration (ax, ay, az) = -grad Phi via autodiff."""
         x, y, z = jnp.asarray(x), jnp.asarray(y), jnp.asarray(z)
         shape = x.shape
 
