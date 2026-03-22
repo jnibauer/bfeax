@@ -53,7 +53,7 @@ ax, ay, az = exp.acceleration(1.0, 0.5, 0.3)  # -grad[phi] via autodiff
 
 ---
 
-## Featured example: triaxial NFW halo
+## Example: triaxial NFW halo
 
 The real power of `bfeax` is handling **non-spherical** density profiles.
 Here we build a triaxial NFW halo with axis ratios p=0.8, q=0.5 and exploit
