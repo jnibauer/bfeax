@@ -417,14 +417,160 @@ The final summation is a single dot product:
   = \mathbf{\Phi}_{\rm modes} \cdot \mathbf{Y}_{\rm modes}.
 \end{equation}
 
-\subsection{Accelerations}
+\subsection{Accelerations (autodiff path)}
 
-Gravitational accelerations are obtained via automatic differentiation:
+Gravitational accelerations can be obtained via automatic differentiation:
 \begin{equation}
   \mathbf{a}(\mathbf{x}) = -\nabla_{\mathbf{x}}\,\Phi(\mathbf{x}),
 \end{equation}
-implemented as \texttt{jax.vmap(jax.grad(\_\_call\_\_))}.  No analytical
-gradient formula is required.
+implemented as \texttt{jax.vmap(jax.grad(\_\_call\_\_))}.  This requires no
+analytical gradient formula but pays the cost of reverse-mode AD through the
+full Legendre recurrence and spline evaluation graph.
+
+\subsection{Forces (analytical path)}
+\label{sec:analytical_force}
+
+The \texttt{force()} method computes $\mathbf{F} = -\nabla\Phi$ directly from
+spline derivatives and spherical-harmonic derivatives, avoiding autodiff
+entirely.  The gradient of the potential in spherical coordinates is
+\begin{equation}
+  \nabla\Phi = \frac{\partial\Phi}{\partial r}\,\hat{\mathbf{r}}
+  + \frac{1}{r}\frac{\partial\Phi}{\partial\theta}\,\hat{\boldsymbol\theta}
+  + \frac{1}{r\sin\theta}\frac{\partial\Phi}{\partial\varphi}\,\hat{\boldsymbol\varphi},
+\end{equation}
+with each component decomposed over modes:
+\begin{align}
+  \frac{\partial\Phi}{\partial r}
+    &= \sum_{\ell m} \frac{1}{r}\frac{\mathrm{d}\Phi_{\ell m}}{\mathrm{d}\!\log r}\, Y_{\ell m}, \\
+  \frac{1}{r}\frac{\partial\Phi}{\partial\theta}
+    &= \frac{1}{r}\sum_{\ell m} \Phi_{\ell m}\,\frac{\partial Y_{\ell m}}{\partial\theta}, \\
+  \frac{1}{r\sin\theta}\frac{\partial\Phi}{\partial\varphi}
+    &= \frac{1}{r}\sum_{\ell m} \Phi_{\ell m}\,\frac{1}{\sin\theta}\frac{\partial Y_{\ell m}}{\partial\varphi}.
+\end{align}
+The radial derivative $\mathrm{d}\Phi_{\ell m}/\mathrm{d}\!\log r$ is obtained
+by differentiating the cubic spline polynomial analytically ($b_i + 2c_i\,\delta u
++ 3d_i\,\delta u^2$), sharing the same interval index as the value evaluation.
+
+\subsubsection{Angular derivatives of $Y_{\ell m}$}
+
+The $\theta$-derivative is computed from the Legendre recurrence relation
+\begin{equation}
+  \frac{\mathrm{d}P_\ell^m}{\mathrm{d}\theta}
+  = \frac{\ell\cos\theta\, P_\ell^m(\cos\theta) - (\ell+m)\, P_{\ell-1}^m(\cos\theta)}
+         {\sin\theta},
+\end{equation}
+which reuses the $P_{\ell-1}^m$ values already computed in the Legendre
+recurrence.  The $\varphi$-derivative exploits the identity
+\begin{equation}
+  \frac{\partial Y_{\ell m}}{\partial\varphi} = -m\, Y_{\ell,\!-m},
+\end{equation}
+so the quantity $(1/\sin\theta)\,\partial Y_{\ell m}/\partial\varphi$ involves
+$P_\ell^{|m|}/\sin\theta$, which is finite for $|m|\geq 1$ since
+$P_\ell^m(\cos\theta) \sim \sin^m\!\theta$ near the poles.
+
+\subsubsection{Trigonometric recurrence}
+
+Rather than computing $\cos(m\varphi)$ and $\sin(m\varphi)$ via
+\texttt{arctan2} followed by per-$m$ trigonometric calls, the Chebyshev
+recurrence is used:
+\begin{align}
+  \cos(m\varphi) &= \cos\bigl((m{-}1)\varphi\bigr)\cos\varphi
+                   - \sin\bigl((m{-}1)\varphi\bigr)\sin\varphi, \\
+  \sin(m\varphi) &= \sin\bigl((m{-}1)\varphi\bigr)\cos\varphi
+                   + \cos\bigl((m{-}1)\varphi\bigr)\sin\varphi,
+\end{align}
+seeded by $\cos\varphi = x/r_{xy}$, $\sin\varphi = y/r_{xy}$, avoiding
+the \texttt{arctan2} call entirely.
+
+\subsubsection{Cartesian conversion}
+
+The spherical force components are converted to Cartesian via the
+unit-vector dot products:
+\begin{equation}
+  F_x = -\bigl(g_r\sin\theta\cos\varphi + g_\theta\cos\theta\cos\varphi
+        - g_\varphi\sin\varphi\bigr),
+\end{equation}
+and analogously for $F_y$, $F_z$, where $g_r$, $g_\theta$, $g_\varphi$ are
+the three spherical gradient sums above.
+
+\subsection{Symmetry-aware mode selection}
+\label{sec:symmetry}
+
+When the density possesses discrete symmetries, many spherical harmonic
+modes are exactly zero and need not be computed.  The code supports four
+symmetry classes, controlled by the \texttt{symmetry} parameter:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\texttt{symmetry} & Constraint & Surviving modes & Count ($\ell_{\max}{=}8$) \\
+\midrule
+\texttt{"spherical"} & $\rho = \rho(r)$ & $(0,0)$ only & 1 \\
+\texttt{"axisymmetric"} & $\rho = \rho(r,\theta)$ & $m=0$ & $\ell_{\max}+1 = 9$ \\
+\texttt{"triaxial"} & 3-plane reflection & even $\ell$, even $m \ge 0$ & 15 \\
+\texttt{None} & general & all $(\ell,m)$ & $(\ell_{\max}+1)^2 = 81$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Triaxial (octant) symmetry.}
+A density satisfying $\rho(x,y,z) = \rho(\pm x, \pm y, \pm z)$ — i.e.\
+invariant under independent reflections in all three coordinate planes —
+constrains the harmonic modes as follows:
+\begin{itemize}
+  \item $y \to -y$ ($\varphi \to -\varphi$): $\sin(m\varphi)$ is odd, so all
+        $m < 0$ (sine) modes vanish.
+  \item $x \to -x$ ($\varphi \to \pi - \varphi$): $\cos(m\varphi) \to
+        (-1)^m \cos(m\varphi)$, so only even $m$ survive.
+  \item $z \to -z$ ($\theta \to \pi - \theta$): $P_\ell^m(-\cos\theta) =
+        (-1)^{\ell+m} P_\ell^m(\cos\theta)$, so $\ell + m$ must be even.
+        Combined with $m$ even, this requires $\ell$ even.
+\end{itemize}
+The surviving modes are therefore $\{(\ell, m) : \ell \text{ even},\;
+m \in \{0, 2, 4, \ldots, \ell\}\}$.
+
+\paragraph{Effect on the pipeline.}
+Symmetry filtering is applied at every stage:
+\begin{enumerate}
+  \item \textbf{Angular projection}: the $Y_{\ell m}$ stack is restricted to
+        the surviving modes, reducing the einsum cost proportionally.
+  \item \textbf{Poisson solve}: only the surviving modes are passed through
+        the scan-based solver.
+  \item \textbf{Spline fitting}: the batched tridiagonal solve operates on
+        fewer rows.
+  \item \textbf{Force evaluation}: fewer modes enter the sum (further refined
+        by mode pruning, \S\ref{sec:pruning}).
+\end{enumerate}
+
+\paragraph{Auto-detection.}
+For the \texttt{from\_spheroid} constructor, symmetry is inferred from the
+axis ratios when the user does not specify it explicitly:
+$p = q = 1 \Rightarrow$ spherical;
+$p = 1$ or $q = 1$ (but not both) $\Rightarrow$ axisymmetric;
+otherwise $\Rightarrow$ triaxial.
+The user may override this with an explicit \texttt{symmetry} argument
+(including \texttt{None} to force all modes).
+
+\subsection{Mode pruning}
+\label{sec:pruning}
+
+At build time, each mode's spline coefficients are scanned: if
+$\max_i\bigl(|a_i|+|b_i|+|c_i|+|d_i|\bigr) < 10^{-10}\,\Phi_{\rm scale}$
+(where $\Phi_{\rm scale}$ is the global maximum over all modes), the mode is
+flagged as negligible.  The analytical force function is then specialised to
+only evaluate active modes, with:
+\begin{itemize}
+  \item \textbf{Pruned coefficient arrays} of shape
+        $(N_{\rm active}, N_r{-}1)$ instead of $(N_{\rm modes}, N_r{-}1)$.
+  \item \textbf{Reduced Legendre recurrence} computed only up to the
+        maximum $\ell$ among active modes.
+  \item \textbf{Reduced trigonometric recurrence} up to the maximum $|m|$
+        among active modes.
+\end{itemize}
+For a spherically symmetric density this reduces the evaluation from
+$(\ell_{\max}+1)^2$ modes to a single $(\ell{=}0, m{=}0)$ mode.
+The specialised function is JIT-compiled once per expansion object as a
+closure that captures the pruned coefficients as XLA constants.
 
 % ===========================================================================
 \section{Scan-based Poisson Solve}

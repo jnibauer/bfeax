@@ -26,6 +26,7 @@ def density_to_sph_coeffs(
     l_max: int,
     n_theta: int | None = None,
     n_phi: int | None = None,
+    lm_keys: list[tuple[int, int]] | None = None,
 ) -> dict[tuple[int, int], Float[Array, "nr"]]:
     """
     Compute rho_lm(r) for all (l,m) with 0<=l<=l_max, -l<=m<=l.
@@ -69,24 +70,9 @@ def density_to_sph_coeffs(
     uy = sin_theta * jnp.sin(phi_grid)
     uz = jnp.cos(theta_grid)
 
-    def _coeffs_at_r(r):
-        # Evaluate rho on the sphere of radius r
-        x = r * ux
-        y = r * uy
-        z = r * uz
-        rho_vals = jax.vmap(jax.vmap(rho))(x, y, z)  # (n_theta, n_phi)
-
-        result = {}
-        for (l, m), Y in Ylm.items():
-            # Numerical integral: sum_ij rho_vals[i,j] * Y[i,j] * w[i,j]
-            result[(l, m)] = jnp.sum(rho_vals * Y * w2d)
-        return result
-
-    # Vectorize over r_grid using vmap for speed.
-    # vmap requires the output to be an array or pytree of arrays, so
-    # we convert the dict to a list (by a fixed key ordering), vmap,
-    # then reconstruct the dict.
-    lm_keys = sorted(Ylm.keys())  # static, deterministic order
+    # Use provided lm_keys or default to all modes
+    if lm_keys is None:
+        lm_keys = sorted(Ylm.keys())
 
     # Pack Y values and quadrature into arrays indexed by a flat lm index
     Y_stack = jnp.stack([Ylm[k] for k in lm_keys])  # (n_lm, n_theta, n_phi)

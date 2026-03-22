@@ -258,7 +258,10 @@ print("Saved: plummer_2d_residual.png")
 
 # Show rho_lm(r) for the (0,0) monopole, and the fitted power-law background
 key = (0, 0)
-alpha_lm, A_lm, log_r_knots, _ = exp._rho_splines[key]
+log_r_knots, _, _, rho_alphas, rho_As = exp._stacked
+mode_idx = exp._lm_keys.index(key)
+alpha_lm = rho_alphas[mode_idx]
+A_lm     = rho_As[mode_idx]
 
 r_knots = np.exp(np.array(log_r_knots))
 rho_00_true = np.array(

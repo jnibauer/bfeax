@@ -102,6 +102,89 @@ def ylm_real(
     return out
 
 
+def ylm_force_components(
+    l_max: int,
+    cos_theta: Float[Array, "..."],
+    sin_theta: Float[Array, "..."],
+    cos_phi: Float[Array, "..."],
+    sin_phi: Float[Array, "..."],
+) -> tuple[Float[Array, "n ..."], Float[Array, "n ..."], Float[Array, "n ..."]]:
+    """
+    Compute Y_lm, dY_lm/dθ, and (1/sinθ) dY_lm/dφ for analytical force evaluation.
+
+    Avoids arccos/arctan2 by working directly with cos/sin values.
+    Uses Chebyshev recurrence for cos(mφ), sin(mφ) instead of per-m trig calls.
+
+    Parameters
+    ----------
+    l_max     : max harmonic degree (static Python int)
+    cos_theta : cos(θ), shape (N,)
+    sin_theta : sin(θ), shape (N,) — must be non-negative
+    cos_phi   : cos(φ), shape (N,)
+    sin_phi   : sin(φ), shape (N,)
+
+    Returns
+    -------
+    Y_arr                    : (n_modes, N)
+    dYdtheta_arr             : (n_modes, N)
+    dYdphi_over_sintheta_arr : (n_modes, N)
+    """
+    P = _alp_recurrence(l_max, cos_theta)
+    sin_theta_safe = jnp.maximum(jnp.abs(sin_theta), 1e-30)
+
+    # Chebyshev recurrence: cos(mφ), sin(mφ) from cos(φ), sin(φ)
+    cos_m = [jnp.ones_like(cos_phi)]    # cos(0·φ) = 1
+    sin_m = [jnp.zeros_like(cos_phi)]   # sin(0·φ) = 0
+    for m in range(1, l_max + 1):
+        cos_m.append(cos_m[m - 1] * cos_phi - sin_m[m - 1] * sin_phi)
+        sin_m.append(sin_m[m - 1] * cos_phi + cos_m[m - 1] * sin_phi)
+
+    Y_list = []
+    dYdth_list = []
+    dYdphi_st_list = []
+
+    for l in range(l_max + 1):
+        for ms in range(-l, l + 1):     # m_signed, matches lm_keys ordering
+            m = abs(ms)
+            N = _normalization(l, m)
+            fac = math.sqrt(2) if m > 0 else 1.0
+
+            # Trig factor for this (l, ms) and the "other" trig for dY/dφ
+            if ms > 0:
+                trig = cos_m[m]
+                trig_other = sin_m[m]
+            elif ms < 0:
+                trig = sin_m[m]
+                trig_other = cos_m[m]
+            else:
+                trig = jnp.ones_like(cos_phi)
+                trig_other = None
+
+            # Y_lm
+            Y_list.append(fac * N * P[l][m] * trig)
+
+            # dY_lm/dθ = fac · N · dP_l^m/dθ · trig
+            # dP_l^m/dθ = [l·cosθ·P_l^m − (l+m)·P_{l−1}^m] / sinθ
+            if l == 0:
+                dYdth_list.append(jnp.zeros_like(cos_theta))
+            else:
+                P_prev = P[l - 1][m] if m <= l - 1 else jnp.zeros_like(cos_theta)
+                dPdth = (l * cos_theta * P[l][m] - (l + m) * P_prev) / sin_theta_safe
+                dYdth_list.append(fac * N * dPdth * trig)
+
+            # (1/sinθ) · dY_lm/dφ
+            # dY_{l,m}/dφ = −m_signed · Y_{l,−m}
+            # (1/sinθ) · dY/dφ = −ms · fac · N · P_l^m / sinθ · trig_other
+            if ms == 0:
+                dYdphi_st_list.append(jnp.zeros_like(cos_phi))
+            else:
+                dYdphi_st_list.append(
+                    -ms * fac * N * P[l][m] / sin_theta_safe * trig_other
+                )
+
+    return jnp.stack(Y_list), jnp.stack(dYdth_list), jnp.stack(dYdphi_st_list)
+
+
 def ylm_grid(
     l_max: int,
     n_theta: int,
