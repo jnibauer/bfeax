@@ -3,7 +3,7 @@
 **JAX-based basis function expansion for gravitational potentials.**
 
 Convert any density function ρ(x,y,z) into a smooth, differentiable potential
-Φ(x,y,z) via spherical harmonic + radial spline decomposition — fully JIT-compiled,
+Φ(x,y,z) via spherical harmonic + radial spline decomposition. Fully JIT-compiled,
 GPU-ready, and autodiff-compatible through `jax.grad`.
 
 ---
@@ -145,7 +145,7 @@ and memory without sacrificing accuracy.
 | `l_max` | 6–10 | 8 is a good default for triaxial halos |
 | `n_r` | 64–128 | 128 converges to ~0.1% for NFW |
 | `r_min` | ~1e-2 × r_s | Should sit well inside the inner cusp |
-| `r_max` | ≥ 30 × r_s | Must be large for NFW — outer tail integral is critical |
+| `r_max` | ≥ 30 × r_s | Must be large for NFW; outer tail integral is critical |
 
 
 ---
