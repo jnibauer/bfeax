@@ -51,10 +51,14 @@ For each radius r_i on the log grid:
 Quadrature: Gauss-Legendre in cos θ (n_theta points) × uniform in φ (n_phi points).
 All radii are processed in a single `jax.vmap` call over the grid.
 
-Defaults (generous margin for non-polynomial integrands like NFW):
+Defaults (empirically converged for triaxial NFW):
 
-    n_theta = 3 * (l_max + 2)
-    n_phi   = 4 * l_max + 7   (always odd, so φ=0 and φ=π not hit together)
+    n_theta = l_max + 2
+    n_phi   = 2 * l_max + 1   (always odd, so φ=0 and φ=π not hit together)
+
+Convergence benchmarks show the error plateaus at these values and does not
+improve with more points.  The old defaults (3*(l_max+2) and 4*l_max+7) were
+~3x and ~2x over-sampled, resulting in ~7x more density evaluations per shell.
 
 ### 2. Poisson solve (poisson.py)
 
@@ -166,12 +170,12 @@ The potential converges faster than the density; l_max=2–4 is often sufficient
 
 | File | What it tests |
 |------|--------------|
-| `test_smoke.py` | Plummer sphere — checks potential accuracy vs analytical result |
-| `test_timing.py` | Plummer convergence with n_r and l_max; JIT eval throughput |
-| `test_flattened_nfw.py` | Oblate NFW (q=0.6) — compares against scipy reference |
-| `test_triaxial_nfw.py` | Triaxial NFW (q1=0.8, q2=0.5) — density reconstruction, mode amplitudes, x-z convergence |
+| `tests/test_smoke.py` | Plummer sphere — checks potential accuracy vs analytical result |
+| `tests/test_timing.py` | Plummer convergence with n_r and l_max; JIT eval throughput |
+| `tests/test_flattened_nfw.py` | Oblate NFW (q=0.6) — compares against scipy reference |
+| `tests/test_triaxial_nfw.py` | Triaxial NFW (q1=0.8, q2=0.5) — density reconstruction, mode amplitudes, x-z convergence |
 
-Run all: `python test_smoke.py && python test_triaxial_nfw.py`
+Run all: `python tests/test_smoke.py && python tests/test_triaxial_nfw.py`
 
 ---
 

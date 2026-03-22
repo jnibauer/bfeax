@@ -45,12 +45,15 @@ def density_to_sph_coeffs(
     """
     if n_theta is None:
         # GL rule with n points integrates polynomials of degree 2n-1 exactly.
-        # NFW is non-polynomial, so use 3x the minimum to stay well-converged.
-        n_theta = 3 * (l_max + 2)
+        # For smooth non-polynomial integrands (NFW, etc.), convergence tests
+        # show n_theta = l_max+2 is sufficient; the error plateaus there and
+        # does not improve with more points.
+        n_theta = l_max + 2
     if n_phi is None:
-        # Need >= 2*l_max+1 to resolve cos(l_max * phi).  Add generous margin
-        # and keep odd so phi=0 and phi=pi are never simultaneously sampled.
-        n_phi = 4 * l_max + 7
+        # Need >= 2*l_max+1 to resolve cos(l_max * phi).  Convergence tests
+        # confirm the error plateaus at the Nyquist minimum; keep odd so
+        # phi=0 and phi=pi are never simultaneously sampled.
+        n_phi = 2 * l_max + 1
 
     # Build angular grid and Y_lm values — static shapes
     theta_grid, phi_grid, Ylm, gl_weights = ylm_grid(l_max, n_theta, n_phi)

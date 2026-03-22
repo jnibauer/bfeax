@@ -177,12 +177,15 @@ computed in a single \texttt{jnp.einsum}:
 \subsection{Default quadrature orders}
 
 The Gauss--Legendre rule with $N_\theta$ points integrates polynomials of
-degree $2N_\theta - 1$ exactly.  For non-polynomial integrands (e.g.\ NFW),
-a factor of 3 margin is used:
+degree $2N_\theta - 1$ exactly.  Convergence benchmarks on a triaxial NFW
+profile show that the density reconstruction error plateaus at:
 \begin{equation}
-  N_\theta = 3(\ell_{\max} + 2), \qquad
-  N_\varphi = 4\ell_{\max} + 7 \quad (\text{kept odd to avoid aliasing}).
+  N_\theta = \ell_{\max} + 2, \qquad
+  N_\varphi = 2\ell_{\max} + 1 \quad (\text{kept odd to avoid aliasing}).
 \end{equation}
+Increasing beyond these values yields no accuracy improvement for smooth
+profiles, reducing the total angular point count by approximately $7\times$
+relative to the previous defaults.
 
 % ===========================================================================
 \section{Radial Poisson Solver}

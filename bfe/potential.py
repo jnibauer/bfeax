@@ -355,9 +355,9 @@ class ExpansionGrid:
         self.l_max = l_max
         self.symmetry = symmetry
         if n_theta is None:
-            n_theta = 3 * (l_max + 2)
+            n_theta = l_max + 2
         if n_phi is None:
-            n_phi = 4 * l_max + 7
+            n_phi = 2 * l_max + 1
 
         self._r_grid = make_radial_grid(n_r, r_min, r_max)
         self._lm_keys_list = _lm_keys(l_max, symmetry)
@@ -481,9 +481,9 @@ class MultipoleExpansion:
         symmetry : "spherical", "axisymmetric", "triaxial", or None
         """
         if n_theta is None:
-            n_theta = 3 * (l_max + 2)
+            n_theta = l_max + 2
         if n_phi is None:
-            n_phi = 4 * l_max + 7
+            n_phi = 2 * l_max + 1
 
         r_grid = make_radial_grid(n_r, r_min, r_max)
         log_r  = jnp.log(r_grid)
@@ -543,9 +543,9 @@ class MultipoleExpansion:
             NOT when spheroid parameters change
         """
         if n_theta is None:
-            n_theta = 3 * (l_max + 2)
+            n_theta = l_max + 2
         if n_phi is None:
-            n_phi = 4 * l_max + 7
+            n_phi = 2 * l_max + 1
 
         # Auto-detect symmetry from axis ratios when not specified
         if symmetry is None:
