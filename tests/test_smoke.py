@@ -13,7 +13,7 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from bfe import MultipoleExpansion
+from bfeax import MultipoleExpansion
 
 # --- Plummer density -------------------------------------------------------
 b = 1.0

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bfeax"
+version = "0.1.0"
+description = "JAX-based basis function expansion for gravitational potentials"
+readme = "CLAUDE.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4",
+    "jaxlib>=0.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "scipy",
+    "matplotlib",
+    "numpy",
+    "jupyter",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bfeax*"]

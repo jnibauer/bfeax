@@ -5,7 +5,7 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from bfe import MultipoleExpansion
+from bfeax import MultipoleExpansion
 
 b = 1.0; M = 1.0
 

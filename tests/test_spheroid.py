@@ -11,7 +11,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 
-from bfe import SpheroidDensity
+from bfeax import SpheroidDensity
 
 # ---------------------------------------------------------------------------
 # NFW-like parameters  (alpha=1, beta=3, gamma=1)

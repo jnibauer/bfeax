@@ -22,7 +22,7 @@ from scipy import integrate
 
 jax.config.update("jax_enable_x64", True)
 
-from bfe import MultipoleExpansion
+from bfeax import MultipoleExpansion
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 rho_s = 1.0

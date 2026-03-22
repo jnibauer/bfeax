@@ -4,7 +4,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from bfe import MultipoleExpansion, SpheroidDensity, ExpansionGrid
+from bfeax import MultipoleExpansion, SpheroidDensity, ExpansionGrid
 
 # --- Parameters ---
 axis = dict(p=0.8, q=0.5)

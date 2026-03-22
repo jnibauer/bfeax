@@ -4,7 +4,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from bfe import MultipoleExpansion, SpheroidDensity
+from bfeax import MultipoleExpansion, SpheroidDensity
 
 # --- Parameters ---
 params = dict(rho0=1.0, alpha=1.0, beta=3.0, gamma=1.0, a=10.0)

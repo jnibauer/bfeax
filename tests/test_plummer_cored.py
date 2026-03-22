@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import time
 
-from bfe import MultipoleExpansion
+from bfeax import MultipoleExpansion
 
 # ---------------------------------------------------------------------------
 # Plummer definitions

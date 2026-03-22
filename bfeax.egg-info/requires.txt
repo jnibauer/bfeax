@@ -1,0 +1,8 @@
+jax>=0.4
+jaxlib>=0.4
+
+[dev]
+scipy
+matplotlib
+numpy
+jupyter

@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 jax.config.update("jax_enable_x64", True)
 agama.setUnits(mass=1, length=1, velocity=1)
 
-from bfe import MultipoleExpansion
+from bfeax import MultipoleExpansion
 
 # ---------------------------------------------------------------------------
 # Parameters
