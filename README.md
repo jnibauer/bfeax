@@ -2,7 +2,7 @@
 
 **JAX-based basis function expansion for gravitational potentials.**
 
-Convert any density function ρ(x,y,z) into a smooth, differentiable potential
+Convert a density function ρ(x,y,z) into a smooth, differentiable potential
 Φ(x,y,z) via spherical harmonic + radial spline decomposition. Fully JIT-compiled,
 GPU-ready, and autodiff-compatible through `jax.grad`.
 
@@ -55,7 +55,7 @@ ax, ay, az = exp.acceleration(1.0, 0.5, 0.3)  # -grad[phi] via autodiff
 
 ## Example: triaxial NFW halo
 
-The real power of `bfeax` is handling **non-spherical** density profiles.
+`bfeax` can handle **non-spherical** density profiles.
 Here we build a triaxial NFW halo with axis ratios p=0.8, q=0.5 and exploit
 octant symmetry to make the build ~3× faster.
 
