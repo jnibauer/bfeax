@@ -64,7 +64,9 @@ def _lm_keys(l_max: int, symmetry: str | None = None) -> list[tuple[int, int]]:
     elif symmetry == "spherical":
         return [(0, 0)]
     elif symmetry == "axisymmetric":
-        return [(l, 0) for l in range(l_max + 1)]
+        # Azimuthal (phi) symmetry -> m=0 only.
+        # Equatorial symmetry (z -> -z): Y_l0(pi - theta) = (-1)^l Y_l0(theta) -> even l only.
+        return [(l, 0) for l in range(0, l_max + 1, 2)]
     elif symmetry == "triaxial":
         # Octant symmetry: even l, even m >= 0 (cosine terms only)
         # x→-x kills odd-m cosine terms; y→-y kills all sine terms (m<0);

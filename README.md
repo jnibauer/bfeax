@@ -132,7 +132,7 @@ and memory without sacrificing accuracy.
 | `symmetry=` | Modes kept | Speedup |
 |-------------|-----------|---------|
 | `None` | All (l, m) | 1× |
-| `"axisymmetric"` | m = 0 only | ~(2l+1)× |
+| `"axisymmetric"` | Even l, m = 0 | ~(2l+1)× |
 | `"triaxial"` | Even l, even m ≥ 0 | ~3× |
 | `"spherical"` | (0, 0) only | maximum |
 
