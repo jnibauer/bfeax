@@ -449,6 +449,12 @@ class MultipoleExpansion:
         # Format: (log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As)
         # where phi_coeffs/rho_res_coeffs are (a,b,c,d) tuples of (n_modes, n_r-1).
         self._stacked = _stacked
+        # Eagerly build the JIT-compiled force function so that _build_force_fn()
+        # is never called lazily inside a JAX tracing context (which would cause
+        # intermediate JAX arrays to leak as tracers via the Python side effect of
+        # setting self._force_jit).
+        if _stacked is not None:
+            self._force_jit = self._build_force_fn()
 
     # ------------------------------------------------------------------
     # Construction
@@ -707,8 +713,6 @@ class MultipoleExpansion:
         x, y, z = jnp.asarray(x), jnp.asarray(y), jnp.asarray(z)
         shape = x.shape
         if self._stacked is not None:
-            if not hasattr(self, '_force_jit'):
-                self._force_jit = self._build_force_fn()
             Fx, Fy, Fz = self._force_jit(x.ravel(), y.ravel(), z.ravel())
             return Fx.reshape(shape), Fy.reshape(shape), Fz.reshape(shape)
         # Fallback to autodiff for dict-based representation
