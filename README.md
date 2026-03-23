@@ -110,7 +110,7 @@ phi_batch = jax.jit(jax.vmap(exp))(pts[:, 0], pts[:, 1], pts[:, 2])
 `SpheroidDensity` provides a fast spline lookup table implementation of the Agama spheroid:
 
 $$
-ρ(r̃) = ρ₀ (r̃/a)^{-γ} [1 + (r̃/a)^α]^{(γ-β)/α}  ×  \exp[-(r̃/r_cut)^ξ]
+\rho(\tilde{r}) = \rho_0 \left(\frac{\tilde{r}}{a}\right)^{-\gamma} \left[ 1 + \left(\frac{\tilde{r}}{a}\right)^\alpha \right]^{\frac{\gamma - \beta}{\alpha}} \exp\left[ -\left(\frac{\tilde{r}}{r_{\text{cut}}}\right)^\xi \right]
 $$
 
 where r̃ = √(x² + (y/p)² + (z/q)²) is the spheroidal radius.
