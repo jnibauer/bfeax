@@ -321,6 +321,120 @@ def _build_expansion_from_grid(r_grid, rho_on_grid, Y_stack, w2d, l_max,
 
 
 # ---------------------------------------------------------------------------
+# Force evaluation without mode pruning — fully JIT-safe
+# ---------------------------------------------------------------------------
+
+@partial(jax.jit, static_argnums=(0, 1))
+def _eval_force_all_modes(lm_keys_tuple, l_max, phi_coeffs, log_r_knots, xs, ys, zs):
+    """
+    Evaluate (Fx, Fy, Fz) summing over all modes in lm_keys_tuple.
+
+    No numpy, no pruning — phi_coeffs may be traced JAX arrays.
+    lm_keys_tuple and l_max are static: loop structure is fixed at compile time.
+
+    Parameters
+    ----------
+    lm_keys_tuple : tuple of (l, m) pairs  [static]
+    l_max         : int                     [static]
+    phi_coeffs    : (a, b, c, d) each (n_modes, n_r-1)
+    log_r_knots   : (n_r,)
+    xs, ys, zs    : (N,) flat arrays of query points
+    """
+    a_c, b_c, c_c, d_c = phi_coeffs
+    lm_keys = list(lm_keys_tuple)
+
+    # Derived static quantities (computed from static args at trace time)
+    l_needed = max(l for l, _ in lm_keys)
+    m_needed = max(abs(m) for _, m in lm_keys)
+    norms = []
+    for l, ms in lm_keys:
+        m = abs(ms)
+        N_lm = _normalization(l, m)
+        norms.append(math.sqrt(2) * N_lm if m > 0 else N_lm)
+
+    # ── Coordinates ──────────────────────────────────────────────────────
+    r_xy_sq = xs * xs + ys * ys
+    r_sq = r_xy_sq + zs * zs
+    r_safe = jnp.maximum(jnp.sqrt(r_sq), 1e-30)
+    r_xy = jnp.sqrt(r_xy_sq)
+    r_xy_safe = jnp.maximum(r_xy, 1e-30)
+
+    cos_theta = zs / r_safe
+    sin_theta = r_xy / r_safe
+    sin_theta_safe = jnp.maximum(sin_theta, 1e-30)
+    cos_phi = jnp.where(r_xy > 1e-30, xs / r_xy_safe, 1.0)
+    sin_phi = jnp.where(r_xy > 1e-30, ys / r_xy_safe, 0.0)
+
+    log_r = jnp.log(r_safe)
+    inv_r = 1.0 / r_safe
+
+    # ── Spline lookup ────────────────────────────────────────────────────
+    idx = jnp.searchsorted(log_r_knots, log_r, side="right") - 1
+    idx = jnp.clip(idx, 0, log_r_knots.shape[0] - 2)
+    dt = log_r - log_r_knots[idx]
+    dt2 = dt * dt
+
+    phi_vals  = a_c[:, idx] + b_c[:, idx] * dt + c_c[:, idx] * dt2 + d_c[:, idx] * (dt2 * dt)
+    phi_dlogr = b_c[:, idx] + 2.0 * c_c[:, idx] * dt + 3.0 * d_c[:, idx] * dt2
+
+    # ── Legendre recurrence ──────────────────────────────────────────────
+    P = _alp_recurrence(l_needed, cos_theta)
+
+    # ── Trig recurrence ──────────────────────────────────────────────────
+    cos_m = [jnp.ones_like(cos_phi)]
+    sin_m = [jnp.zeros_like(cos_phi)]
+    for mm in range(1, m_needed + 1):
+        cos_m.append(cos_m[mm - 1] * cos_phi - sin_m[mm - 1] * sin_phi)
+        sin_m.append(sin_m[mm - 1] * cos_phi + cos_m[mm - 1] * sin_phi)
+
+    # ── Y_lm and derivatives for all modes ──────────────────────────────
+    Y_list, dYdth_list, dYdphi_st_list = [], [], []
+    for i_mode, (l, ms) in enumerate(lm_keys):
+        m = abs(ms)
+        fac = norms[i_mode]
+
+        if ms > 0:
+            trig = cos_m[m]
+            trig_other = sin_m[m]
+        elif ms < 0:
+            trig = sin_m[m]
+            trig_other = cos_m[m]
+        else:
+            trig = 1.0
+            trig_other = None
+
+        Plm = P[l][m]
+        Y_list.append(fac * Plm * trig)
+
+        if l == 0:
+            dYdth_list.append(jnp.zeros_like(cos_theta))
+        else:
+            P_prev = P[l - 1][m] if m <= l - 1 else 0.0
+            dPdth = (l * cos_theta * Plm - (l + m) * P_prev) / sin_theta_safe
+            dYdth_list.append(fac * dPdth * trig)
+
+        if ms == 0:
+            dYdphi_st_list.append(jnp.zeros_like(cos_phi))
+        else:
+            dYdphi_st_list.append(-ms * fac * Plm / sin_theta_safe * trig_other)
+
+    Y_arr         = jnp.stack(Y_list)
+    dYdth_arr     = jnp.stack(dYdth_list)
+    dYdphi_st_arr = jnp.stack(dYdphi_st_list)
+
+    # ── Assemble forces ──────────────────────────────────────────────────
+    dPhi_dr      = jnp.einsum('mn,mn->n', phi_dlogr, Y_arr)         * inv_r
+    dPhi_dth_r   = jnp.einsum('mn,mn->n', phi_vals,  dYdth_arr)     * inv_r
+    dPhi_dphi_rs = jnp.einsum('mn,mn->n', phi_vals,  dYdphi_st_arr) * inv_r
+
+    Fx = -(dPhi_dr * sin_theta * cos_phi + dPhi_dth_r * cos_theta * cos_phi - dPhi_dphi_rs * sin_phi)
+    Fy = -(dPhi_dr * sin_theta * sin_phi + dPhi_dth_r * cos_theta * sin_phi + dPhi_dphi_rs * cos_phi)
+    Fz = -(dPhi_dr * cos_theta           - dPhi_dth_r * sin_theta)
+
+    return Fx, Fy, Fz
+
+
+# ---------------------------------------------------------------------------
 # ExpansionGrid — precomputed quadrature grid for fast repeated builds
 # ---------------------------------------------------------------------------
 
@@ -385,14 +499,16 @@ class ExpansionGrid:
     def __call__(
         self,
         rho,
+        prune_modes: bool = True,
     ) -> "MultipoleExpansion":
         """Build a MultipoleExpansion from a density function rho(x, y, z)."""
         rho_on_grid = jax.vmap(jax.vmap(jax.vmap(rho)))(self.x, self.y, self.z)
-        return self.from_values(rho_on_grid)
+        return self.from_values(rho_on_grid, prune_modes=prune_modes)
 
     def from_values(
         self,
         rho_on_grid: Float[Array, "n_r n_theta n_phi"],
+        prune_modes: bool = True,
     ) -> "MultipoleExpansion":
         """
         Build from precomputed density values on the grid.
@@ -410,6 +526,7 @@ class ExpansionGrid:
         stacked = (log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As)
         return MultipoleExpansion(
             self.l_max, {}, {}, _stacked=stacked, symmetry=self.symmetry,
+            prune_modes=prune_modes,
         )
 
 
@@ -440,12 +557,14 @@ class MultipoleExpansion:
         *,
         _stacked: tuple | None = None,
         symmetry: str | None = None,
+        prune_modes: bool = True,
     ):
         self.l_max = l_max
         self.symmetry = symmetry
         self._phi_splines = phi_splines
         self._rho_splines = rho_splines
         self._lm_keys = _lm_keys(l_max, symmetry)
+        self._prune_modes = prune_modes
 
         # Optional stacked representation for fast-path eval (from_spheroid).
         # Format: (log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As)
@@ -455,7 +574,7 @@ class MultipoleExpansion:
         # is never called lazily inside a JAX tracing context (which would cause
         # intermediate JAX arrays to leak as tracers via the Python side effect of
         # setting self._force_jit).
-        if _stacked is not None:
+        if _stacked is not None and prune_modes:
             self._force_jit = self._build_force_fn()
 
     # ------------------------------------------------------------------
@@ -473,20 +592,22 @@ class MultipoleExpansion:
         n_theta: int | None = None,
         n_phi: int | None = None,
         symmetry: str | None = None,
+        prune_modes: bool = True,
     ) -> "MultipoleExpansion":
         """
         Build a MultipoleExpansion from a density function rho(x,y,z).
 
         Parameters
         ----------
-        rho      : callable rho(x,y,z) -> scalar
-        r_min    : inner radius of the radial grid
-        r_max    : outer radius of the radial grid
-        n_r      : number of radial grid points
-        l_max    : maximum spherical harmonic degree
-        n_theta  : GL quadrature nodes  (default: 3*(l_max+2))
-        n_phi    : uniform phi points   (default: 4*l_max+7)
-        symmetry : "spherical", "axisymmetric", "triaxial", or None
+        rho         : callable rho(x,y,z) -> scalar
+        r_min       : inner radius of the radial grid
+        r_max       : outer radius of the radial grid
+        n_r         : number of radial grid points
+        l_max       : maximum spherical harmonic degree
+        n_theta     : GL quadrature nodes  (default: 3*(l_max+2))
+        n_phi       : uniform phi points   (default: 4*l_max+7)
+        symmetry    : "spherical", "axisymmetric", "triaxial", or None
+        prune_modes : bool, default True — see from_spheroid for details
         """
         if n_theta is None:
             n_theta = l_max + 2
@@ -518,7 +639,8 @@ class MultipoleExpansion:
         )
 
         stacked = (log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As)
-        return cls(l_max, {}, {}, _stacked=stacked, symmetry=symmetry)
+        return cls(l_max, {}, {}, _stacked=stacked, symmetry=symmetry,
+                   prune_modes=prune_modes)
 
     @classmethod
     def from_spheroid(
@@ -540,6 +662,7 @@ class MultipoleExpansion:
         n_theta: int | None = None,
         n_phi: int | None = None,
         symmetry: str | None = None,
+        prune_modes: bool = True,
     ) -> "MultipoleExpansion":
         """
         Build a MultipoleExpansion from Agama-style spheroid parameters.
@@ -549,14 +672,24 @@ class MultipoleExpansion:
           - spline fitting is batched (one matrix factorisation for all modes)
           - the JIT-compiled core only recompiles when grid shapes change,
             NOT when spheroid parameters change
+
+        prune_modes : bool, default True
+            When True (default), negligible modes are dropped at construction
+            time for faster force evaluation.  Set to False when building
+            inside jax.jit with traced parameters (e.g. a traced q), so that
+            no numpy operations touch the coefficients at construction time.
         """
         if n_theta is None:
             n_theta = l_max + 2
         if n_phi is None:
             n_phi = 2 * l_max + 1
 
-        # Auto-detect symmetry from axis ratios when not specified
-        if symmetry is None:
+        # Auto-detect symmetry from axis ratios when not specified.
+        # Only safe when p and q are concrete Python scalars; if either is a
+        # JAX tracer (e.g. inside jax.jit) comparisons produce boolean arrays
+        # which cannot be used in Python if-statements, so we leave symmetry
+        # as None (full general expansion) in that case.
+        if symmetry is None and isinstance(p, (int, float)) and isinstance(q, (int, float)):
             if p == 1.0 and q == 1.0:
                 symmetry = "spherical"
             elif p == 1.0 or q == 1.0:
@@ -575,15 +708,16 @@ class MultipoleExpansion:
 
         phi_coeffs, rho_res_coeffs, rho_alphas, rho_As = _spheroid_core(
             r_grid,
-            float(rho0), float(alpha), float(beta), float(gamma), float(a),
-            float(p), float(q), r_cut_eff, xi_eff,
+            rho0, alpha, beta, gamma, a,
+            p, q, r_cut_eff, xi_eff,
             l_max, n_theta, n_phi, lm_tuple,
         )
 
         # Store stacked arrays directly — skip dict unpacking
         stacked = (log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As)
 
-        return cls(l_max, {}, {}, _stacked=stacked, symmetry=symmetry)
+        return cls(l_max, {}, {}, _stacked=stacked, symmetry=symmetry,
+                   prune_modes=prune_modes)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -709,13 +843,29 @@ class MultipoleExpansion:
 
         Much faster than acceleration() because it avoids reverse-mode
         autodiff — forces are computed directly from spline derivatives
-        and analytical spherical-harmonic derivatives.  Modes with
-        negligible coefficients are pruned automatically.
+        and analytical spherical-harmonic derivatives.
+
+        When prune_modes=True (default): modes with negligible coefficients
+        are dropped at construction time for faster evaluation.  Requires
+        concrete (non-traced) coefficients — not usable inside jax.jit when
+        the expansion was built from traced parameters.
+
+        When prune_modes=False: all modes are summed unconditionally. Fully
+        JIT-safe — the expansion may be built inside jax.jit with traced
+        parameters (e.g. a traced flattening q).
         """
         x, y, z = jnp.asarray(x), jnp.asarray(y), jnp.asarray(z)
         shape = x.shape
         if self._stacked is not None:
-            Fx, Fy, Fz = self._force_jit(x.ravel(), y.ravel(), z.ravel())
+            if self._prune_modes:
+                Fx, Fy, Fz = self._force_jit(x.ravel(), y.ravel(), z.ravel())
+            else:
+                log_r_knots, phi_coeffs, _, _, _ = self._stacked
+                lm_tuple = tuple(self._lm_keys)
+                Fx, Fy, Fz = _eval_force_all_modes(
+                    lm_tuple, self.l_max, phi_coeffs, log_r_knots,
+                    x.ravel(), y.ravel(), z.ravel(),
+                )
             return Fx.reshape(shape), Fy.reshape(shape), Fz.reshape(shape)
         # Fallback to autodiff for dict-based representation
         return self.acceleration(x, y, z)

@@ -3,7 +3,7 @@ from .grid import make_radial_grid
 from .sph_harm import ylm_real
 from .density_coeffs import density_to_sph_coeffs
 from .poisson import solve_poisson_lm
-from .potential import MultipoleExpansion, ExpansionGrid
+from .potential import MultipoleExpansion, ExpansionGrid, _eval_force_all_modes
 from .spheroid import SpheroidDensity
 
 __all__ = [
@@ -13,5 +13,6 @@ __all__ = [
     "solve_poisson_lm",
     "MultipoleExpansion",
     "ExpansionGrid",
+    "_eval_force_all_modes",
     "SpheroidDensity",
 ]
