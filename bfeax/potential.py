@@ -574,8 +574,15 @@ class MultipoleExpansion:
         # is never called lazily inside a JAX tracing context (which would cause
         # intermediate JAX arrays to leak as tracers via the Python side effect of
         # setting self._force_jit).
+        # Guard: _build_force_fn calls np.asarray() which requires concrete
+        # (non-traced) arrays.  Skip if any leaf is abstract (e.g. during
+        # pytree unflatten inside a vmap/jit trace).
         if _stacked is not None and prune_modes:
-            self._force_jit = self._build_force_fn()
+            # _build_force_fn calls np.asarray() which requires concrete arrays.
+            # Skip if we're inside a JAX tracing context (e.g. vmap unflatten).
+            _is_traced = isinstance(_stacked[1][0], jax.core.Tracer)
+            if not _is_traced:
+                self._force_jit = self._build_force_fn()
 
     # ------------------------------------------------------------------
     # Construction
@@ -857,7 +864,9 @@ class MultipoleExpansion:
         x, y, z = jnp.asarray(x), jnp.asarray(y), jnp.asarray(z)
         shape = x.shape
         if self._stacked is not None:
-            if self._prune_modes:
+            # _force_jit is None when prune_modes=True but the expansion was
+            # reconstructed inside a JAX tracing context (vmap unflatten).
+            if self._prune_modes and getattr(self, "_force_jit", None) is not None:
                 Fx, Fy, Fz = self._force_jit(x.ravel(), y.ravel(), z.ravel())
             else:
                 log_r_knots, phi_coeffs, _, _, _ = self._stacked
@@ -1056,6 +1065,63 @@ class MultipoleExpansion:
             k: (float(alpha), float(A))
             for k, (alpha, A, _, _) in self._rho_splines.items()
         }
+
+
+# ---------------------------------------------------------------------------
+# JAX pytree registration for MultipoleExpansion
+# ---------------------------------------------------------------------------
+# Registers the expansion's internal spline arrays as proper dynamic JAX
+# leaves so that jit / vmap / grad can operate on them.  Without this,
+# storing a MultipoleExpansion in an eqx.field(static=True) causes the
+# arrays inside _stacked to escape their vmap trace and raises
+# UnexpectedTracerError when multiple expansions are batched together.
+#
+# Only the stacked path (from_density / from_spheroid) is fully dynamic.
+# The legacy dict-based path (_phi_splines / _rho_splines non-empty) is
+# reconstructed with empty dicts after unflatten — those diagnostics
+# (rho_lm_amplitudes, inner_slopes) will not work on vmapped instances,
+# but that path is never used for TNFWSubhaloLinePotential.
+
+def _multipole_tree_flatten(exp):
+    """Flatten MultipoleExpansion into (dynamic_leaves, static_aux)."""
+    if exp._stacked is not None:
+        log_r, phi_coeffs, rho_res_coeffs, rho_alphas, rho_As = exp._stacked
+        a_phi, b_phi, c_phi, d_phi = phi_coeffs
+        a_rho, b_rho, c_rho, d_rho = rho_res_coeffs
+        leaves = [log_r, a_phi, b_phi, c_phi, d_phi,
+                  a_rho, b_rho, c_rho, d_rho, rho_alphas, rho_As]
+    else:
+        leaves = []
+    # aux must be fully hashable; (int, str|None, bool, bool) qualifies.
+    aux = (exp.l_max, exp.symmetry, exp._prune_modes, exp._stacked is not None)
+    return leaves, aux
+
+
+def _multipole_tree_unflatten(aux, leaves):
+    """Reconstruct a MultipoleExpansion from static aux and dynamic leaves."""
+    l_max, symmetry, prune_modes, has_stacked = aux
+    if has_stacked:
+        log_r, a_phi, b_phi, c_phi, d_phi, a_rho, b_rho, c_rho, d_rho, rho_alphas, rho_As = leaves
+        stacked = (
+            log_r,
+            (a_phi, b_phi, c_phi, d_phi),
+            (a_rho, b_rho, c_rho, d_rho),
+            rho_alphas,
+            rho_As,
+        )
+    else:
+        stacked = None
+    return MultipoleExpansion(
+        l_max, {}, {},
+        _stacked=stacked, symmetry=symmetry, prune_modes=prune_modes,
+    )
+
+
+jax.tree_util.register_pytree_node(
+    MultipoleExpansion,
+    _multipole_tree_flatten,
+    _multipole_tree_unflatten,
+)
 
 
 # ---------------------------------------------------------------------------

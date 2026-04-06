@@ -174,18 +174,7 @@ computed in a single \texttt{jnp.einsum}:
   Y_{\ell m}^{jk}\, w_j\, \Delta\varphi.
 \end{equation}
 
-\subsection{Default quadrature orders}
 
-The Gauss--Legendre rule with $N_\theta$ points integrates polynomials of
-degree $2N_\theta - 1$ exactly.  Convergence benchmarks on a triaxial NFW
-profile show that the density reconstruction error plateaus at:
-\begin{equation}
-  N_\theta = \ell_{\max} + 2, \qquad
-  N_\varphi = 2\ell_{\max} + 1 \quad (\text{kept odd to avoid aliasing}).
-\end{equation}
-Increasing beyond these values yields no accuracy improvement for smooth
-profiles, reducing the total angular point count by approximately $7\times$
-relative to the previous defaults.
 
 % ===========================================================================
 \section{Radial Poisson Solver}
@@ -219,19 +208,6 @@ $I_{\rm in}$ is a running integral accumulated from small $r$ outward
 (``inside-out''); $I_{\rm out}$ is accumulated from large $r$ inward
 (``outside-in'').  Both are evaluated by the trapezoidal rule on the
 log-spaced grid.
-
-\subsection{Trapezoidal discretisation}
-
-Let $f_i^{\rm in} = \rho_{\ell m}(r_i)\, r_i^{\ell+2}$ and
-$\Delta r_i = r_{i+1} - r_i$.  Then
-\begin{equation}
-  I_{\rm in}(r_i) = \Delta I_{\rm in}
-  + \sum_{j=0}^{i-1} \tfrac{1}{2}\bigl(f_j^{\rm in} + f_{j+1}^{\rm in}\bigr)
-    \Delta r_j,
-\end{equation}
-where $\Delta I_{\rm in}$ is the analytic inner tail correction (Section
-\ref{sec:boundary}).  The outside-in sum for $I_{\rm out}$ is constructed
-analogously via a reversed cumulative sum.
 
 % ===========================================================================
 \section{Boundary Corrections}
